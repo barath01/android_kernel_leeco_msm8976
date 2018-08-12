@@ -83,6 +83,8 @@ struct tvec_base {
 	unsigned long timer_jiffies;
 	unsigned long next_timer;
 	unsigned long active_timers;
+	unsigned long all_timers;
+	int cpu;
 	struct tvec_root tv1;
 	struct tvec tv2;
 	struct tvec tv3;
@@ -343,6 +345,20 @@ void set_timer_slack(struct timer_list *timer, int slack_hz)
 }
 EXPORT_SYMBOL_GPL(set_timer_slack);
 
+/*
+ * If the list is empty, catch up ->timer_jiffies to the current time.
+ * The caller must hold the tvec_base lock.  Returns true if the list
+ * was empty and therefore ->timer_jiffies was updated.
+ */
+static bool catchup_timer_jiffies(struct tvec_base *base)
+{
+	if (!base->all_timers) {
+		base->timer_jiffies = jiffies;
+		return true;
+	}
+	return false;
+}
+
 static void
 __internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 {
@@ -391,19 +407,38 @@ static int internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 {
 	int leftmost = 0;
 
+	(void)catchup_timer_jiffies(base);
 	__internal_add_timer(base, timer);
 	/*
 	 * Update base->active_timers and base->next_timer
 	 */
 	if (!tbase_get_deferrable(timer->base)) {
-		if (time_before(timer->expires, base->next_timer)) {
-			leftmost = 1;
+		if (!base->active_timers++ ||
+		    time_before(timer->expires, base->next_timer)) {
 			base->next_timer = timer->expires;
+			leftmost = 1;
 		}
-		base->active_timers++;
 	}
+	base->all_timers++;
 
+	/*
+	 * Check whether the other CPU is in dynticks mode and needs
+	 * to be triggered to reevaluate the timer wheel.
+	 * We are protected against the other CPU fiddling
+	 * with the timer by holding the timer base lock. This also
+	 * makes sure that a CPU on the way to stop its tick can not
+	 * evaluate the timer wheel.
+	 *
+	 * Spare the IPI for deferrable timers on idle targets though.
+	 * The next busy ticks will take care of it. Except full dynticks
+	 * require special care against races with idle_cpu(), lets deal
+	 * with that later.
+	 */
+	if (leftmost || tick_nohz_full_cpu(base->cpu))
+		wake_up_nohz_cpu(base->cpu);
+	
 	return leftmost;
+
 }
 
 #ifdef CONFIG_DEBUG_OBJECTS_TIMERS
@@ -658,6 +693,8 @@ detach_expired_timer(struct timer_list *timer, struct tvec_base *base)
 	detach_timer(timer, true);
 	if (!tbase_get_deferrable(timer->base))
 		base->active_timers--;
+	base->all_timers--;
+	(void)catchup_timer_jiffies(base);
 }
 
 static int detach_if_pending(struct timer_list *timer, struct tvec_base *base,
@@ -672,6 +709,8 @@ static int detach_if_pending(struct timer_list *timer, struct tvec_base *base,
 		if (timer->expires == base->next_timer)
 			base->next_timer = base->timer_jiffies;
 	}
+	base->all_timers--;
+	(void)catchup_timer_jiffies(base);
 	return 1;
 }
 
@@ -713,7 +752,7 @@ __mod_timer(struct timer_list *timer, unsigned long expires,
 {
 	struct tvec_base *base, *new_base;
 	unsigned long flags;
-	int ret = 0, cpu, leftmost;
+	int ret = 0, cpu;
 
 	BUG_ON(!timer->function);
 
@@ -759,23 +798,8 @@ __mod_timer(struct timer_list *timer, unsigned long expires,
 #endif
 
 	timer->expires = expires;
-	leftmost = internal_add_timer(base, timer);
+	internal_add_timer(base, timer);
 
-#ifdef CONFIG_SCHED_HMP
-	/*
-	 * Check whether the other CPU is in dynticks mode and needs
-	 * to be triggered to reevaluate the timer wheel.
-	 * We are protected against the other CPU fiddling
-	 * with the timer by holding the timer base lock. This also
-	 * makes sure that a CPU on the way to stop its tick can not
-	 * evaluate the timer wheel.
-	 *
-	 * This test is needed for only CONFIG_SCHED_HMP, as !CONFIG_SCHED_HMP
-	 * selects non-idle cpu as target of timer migration.
-	 */
-	if (cpu != smp_processor_id() && leftmost)
-		wake_up_nohz_cpu(cpu);
-#endif
 
 out_unlock:
 	spin_unlock_irqrestore(&base->lock, flags);
@@ -935,7 +959,6 @@ void add_timer_on(struct timer_list *timer, int cpu)
 	struct tvec_base *new_base = per_cpu(tvec_bases, cpu);
 	struct tvec_base *base;
 	unsigned long flags;
-	int leftmost;
 
 	BUG_ON(timer_pending(timer) || !timer->function);
 
@@ -953,18 +976,10 @@ void add_timer_on(struct timer_list *timer, int cpu)
 		timer_set_base(timer, base);
 	}
 	debug_activate(timer, timer->expires);
-	leftmost = internal_add_timer(base, timer);
+	
+	internal_add_timer(base, timer);
 
-	/*
-	 * Check whether the other CPU is in dynticks mode and needs
-	 * to be triggered to reevaluate the timer wheel.
-	 * We are protected against the other CPU fiddling
-	 * with the timer by holding the timer base lock. This also
-	 * makes sure that a CPU on the way to stop its tick can not
-	 * evaluate the timer wheel.
-	 */
-	if (leftmost)
-		wake_up_nohz_cpu(cpu);
+
 	spin_unlock_irqrestore(&base->lock, flags);
 }
 EXPORT_SYMBOL_GPL(add_timer_on);
@@ -1168,6 +1183,10 @@ static inline void __run_timers(struct tvec_base *base)
 	struct timer_list *timer;
 
 	spin_lock_irq(&base->lock);
+	if (catchup_timer_jiffies(base)) {
+		spin_unlock_irq(&base->lock);
+		return;
+	}
 	while (time_after_eq(jiffies, base->timer_jiffies)) {
 		struct list_head work_list;
 		struct list_head *head = &work_list;
@@ -1182,7 +1201,7 @@ static inline void __run_timers(struct tvec_base *base)
 					!cascade(base, &base->tv4, INDEX(2)))
 			cascade(base, &base->tv5, INDEX(3));
 		++base->timer_jiffies;
-		list_replace_init(base->tv1.vec + index, &work_list);
+		list_replace_init(base->tv1.vec + index, head);
 		while (!list_empty(head)) {
 			void (*fn)(unsigned long);
 			unsigned long data;
@@ -1583,9 +1602,8 @@ static int __cpuinit init_timers_cpu(int cpu)
 			if (!base)
 				return -ENOMEM;
 
-			/* Make sure that tvec_base is 2 byte aligned */
-			if (tbase_get_deferrable(base)) {
-				WARN_ON(1);
+			/* Make sure tvec_base has TIMER_FLAG_MASK bits free */
+			if (WARN_ON(base != tbase_get_base(base))) {
 				kfree(base);
 				return -ENOMEM;
 			}
@@ -1607,6 +1625,7 @@ static int __cpuinit init_timers_cpu(int cpu)
 		}
 		spin_lock_init(&base->lock);
 		tvec_base_done[cpu] = 1;
+		base->cpu = cpu;
 	} else {
 		if (cpu != NR_CPUS)
 			base = per_cpu(tvec_bases, cpu);
@@ -1629,6 +1648,7 @@ static int __cpuinit init_timers_cpu(int cpu)
 	base->timer_jiffies = jiffies;
 	base->next_timer = base->timer_jiffies;
 	base->active_timers = 0;
+	base->all_timers = 0;
 	return 0;
 }
 
